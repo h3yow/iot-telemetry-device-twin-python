@@ -45,6 +45,23 @@ class DesiredIn(BaseModel):
     values: dict[str, Any]
     expected_version: int | None = None
     merge: bool = True
+    ack_timeout_ms: int | None = None
+
+
+class RollbackIn(BaseModel):
+    version: int | None = None
+
+
+class BatchItemIn(BaseModel):
+    device_id: str
+    values: dict[str, Any] = Field(default_factory=dict)
+    expected_version: int | None = None
+    merge: bool = True
+
+
+class BatchIn(BaseModel):
+    batch_id: str
+    items: list[BatchItemIn]
 
 
 class RuleIn(BaseModel):
@@ -109,8 +126,70 @@ def create_app() -> FastAPI:
         twin = svc.update_desired(
             admin, device_id, body.values,
             expected_version=body.expected_version, merge=body.merge,
+            ack_timeout_ms=body.ack_timeout_ms,
         )
-        return _twin_dict(twin)
+        return _twin_dict(twin, ack_deadline_ms=svc._twin(device_id).ack_deadline())
+
+    @app.post("/admin/desired/{device_id}/rollback")
+    def rollback_desired(
+        device_id: str, body: RollbackIn, admin: Principal = Depends(admin_principal)
+    ) -> dict:
+        try:
+            outcome = svc.rollback_desired(admin, device_id, version=body.version)
+        except DomainError as exc:
+            status_code = (
+                409 if exc.code in (
+                    ErrorCode.VERSION_CONFLICT, ErrorCode.ALREADY_CONFIRMED
+                ) else 400
+            )
+            raise HTTPException(
+                status_code=status_code,
+                detail={"error_code": exc.code, "message": exc.message},
+            )
+        return {
+            "device_id": outcome.device_id,
+            "rolled_back": outcome.rolled_back,
+            "idempotent": outcome.idempotent,
+            "desired_version": outcome.desired_version,
+            "detail": outcome.detail,
+        }
+
+    @app.post("/admin/desired-batch")
+    def batch_update_desired(body: BatchIn, admin: Principal = Depends(admin_principal)) -> dict:
+        from .models import BatchDesiredItem
+
+        items = [
+            BatchDesiredItem(
+                device_id=i.device_id,
+                values=i.values,
+                expected_version=i.expected_version,
+                merge=i.merge,
+            )
+            for i in body.items
+        ]
+        try:
+            operation = svc.batch_update_desired(admin, body.batch_id, items)
+        except DomainError as exc:
+            status_code = 409 if exc.code == ErrorCode.IDEMPOTENCY_KEY_REUSED else 400
+            raise HTTPException(
+                status_code=status_code,
+                detail={"error_code": exc.code, "message": exc.message},
+            )
+        return _batch_dict(operation)
+
+    @app.get("/admin/desired-batch/{batch_id}")
+    def get_batch(batch_id: str, admin: Principal = Depends(admin_principal)) -> dict:
+        try:
+            operation = svc.get_batch(admin, batch_id)
+        except DomainError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": exc.code, "message": exc.message},
+            )
+        initial = _batch_dict(operation)
+        latest = svc.batch_device_status(admin, batch_id)
+        initial["latest"] = [vars(r) for r in latest]
+        return initial
 
     @app.get("/admin/alerts/{device_id}")
     def get_alerts(device_id: str, admin: Principal = Depends(admin_principal)) -> dict:
@@ -125,7 +204,7 @@ def create_app() -> FastAPI:
     ) -> dict:
         principal = _principal(device_id, authorization)
         twin = svc.connect(principal, device_id) if body.online else svc.disconnect(principal, device_id)
-        return _twin_dict(twin)
+        return _twin_dict(twin, ack_deadline_ms=svc._twin(device_id).ack_deadline())
 
     @app.post("/devices/{device_id}/telemetry")
     def post_telemetry(
@@ -162,16 +241,26 @@ def create_app() -> FastAPI:
     @app.get("/devices/{device_id}/twin")
     def get_twin(device_id: str, authorization: str | None = Header(default=None)) -> dict:
         principal = _principal(device_id, authorization)
-        return _twin_dict(svc.get_twin(principal, device_id))
+        twin_state = svc.get_twin(principal, device_id)
+        return _twin_dict(twin_state, ack_deadline_ms=svc._twin(device_id).ack_deadline())
 
     return app
 
 
-def _twin_dict(twin: Any) -> dict:
+def _batch_dict(operation: Any) -> dict:
+    return {
+        "batch_id": operation.batch_id,
+        "created_at_ms": operation.created_at_ms,
+        "results": [vars(r) for r in operation.results],
+    }
+
+
+def _twin_dict(twin: Any, ack_deadline_ms: int | None = None) -> dict:
     return {
         "device_id": twin.device_id,
         "connection": twin.connection.value,
         "sync_status": twin.sync_status.value,
+        "ack_deadline_ms": ack_deadline_ms,
         "desired": (
             {"version": twin.desired.version, "values": twin.desired.values,
              "updated_at_ms": twin.desired.updated_at_ms}

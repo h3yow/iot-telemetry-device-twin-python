@@ -8,6 +8,7 @@ __all__ = [
     "dedupe",
     "telemetry",
     "twin",
+    "batch",
     "rules",
     "alerts",
     "service",

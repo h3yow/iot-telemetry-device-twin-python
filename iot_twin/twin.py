@@ -20,6 +20,20 @@
 防倒退
 ------
 上报状态按 ``(ts_ms, seq)`` 水位并入，过期样本不会倒退上报状态。
+
+确认时限（ACK_TIMEOUT）
+-----------------------
+下发期望时可带 ``ack_timeout_ms``：设备在线时从下发时刻起算；离线期间
+下发的，离线不计时，重连那一刻才开始计时。超时后结论为独立的
+``ACK_TIMEOUT``，区别于"按旧版本执行/取值对不上"的 ``CONFLICTED``。
+超时是可纠正的中间结论：迟到的正确确认会自动改判 ``IN_SYNC``，错误确认
+改判 ``CONFLICTED``。超时判定为惰性复核，不依赖后台定时器。
+
+撤销（rollback）
+---------------
+只允许撤销当前挂起、尚未确认的期望；撤销回到上一次已确认取值并另起一个
+单调新版本（不回收旧版本号，避免与迟到确认混淆）。对同一版本重复撤销
+幂等；已确认生效的期望抛出 ``ALREADY_CONFIRMED``，需重新下发覆盖。
 """
 from __future__ import annotations
 
@@ -31,6 +45,7 @@ from .models import (
     ConnectionState,
     DesiredState,
     ReportedState,
+    RollbackOutcome,
     SyncStatus,
     TwinState,
 )
@@ -50,6 +65,14 @@ class DeviceTwin:
         self.device_id = device_id
         self.state = TwinState(device_id=device_id)
         self._lock = threading.RLock()
+        # 当前挂起期望的确认时限（None 表示未设定/已不计时）
+        self._ack_deadline_ms: int | None = None
+        # 当前挂起期望允许的确认时长（重连时据此从上线时刻重新起算）
+        self._ack_timeout_ms: int | None = None
+        # 最近一次被设备确认生效的期望（用于撤销回退）
+        self._confirmed_desired: DesiredState | None = None
+        # 已撤销记录：{被撤销的期望版本: 回退到的版本}，保证重复撤销幂等
+        self._rolled_back_versions: dict[int, int | None] = {}
 
     # ---- 连接生命周期 ----
     def connect(self, now_ms: int) -> TwinState:
@@ -60,6 +83,16 @@ class DeviceTwin:
             # 重连时若仍有未完成的期望状态，保持 PENDING 等待重发对账
             if self.state.sync_status is SyncStatus.CONFLICTED:
                 self.state.sync_status = SyncStatus.PENDING
+            # 离线期间挂起（或上次在线未确认）的期望，时限从重新上线一刻重算，
+            # 绝不从下发时刻起算，避免设备刚重连就被判超时。
+            if self.state.desired is not None and self._ack_timeout_ms is not None:
+                if self.state.sync_status in (
+                    SyncStatus.PENDING,
+                    SyncStatus.ACK_TIMEOUT,
+                ):
+                    # 时限重新起算意味着一个新的确认窗口：旧的超时结论复位
+                    self.state.sync_status = SyncStatus.PENDING
+                    self._ack_deadline_ms = now_ms + self._ack_timeout_ms
             return self.snapshot()
 
     def disconnect(self, now_ms: int) -> TwinState:
@@ -67,6 +100,8 @@ class DeviceTwin:
             self.state.connection = ConnectionState.OFFLINE
             self.state.connected_since_ms = None
             self.state.last_event_ms = now_ms
+            # 离线不计时；重新上线后按剩余挂起期望重新起算
+            self._ack_deadline_ms = None
             return self.snapshot()
 
     # ---- 上报状态 ----
@@ -103,6 +138,8 @@ class DeviceTwin:
             )
             self.state.last_event_ms = now_ms
             self._reconcile(ack_desired_version)
+            # 对账可能确认、冲突或纠正之前的超时结论；之后再惰性复核时限
+            self._evaluate_ack_deadline_locked(now_ms)
             return True, self.state.sync_status, "上报已并入并完成对账"
 
     def _reconcile(self, ack_desired_version: int | None) -> None:
@@ -119,11 +156,18 @@ class DeviceTwin:
         if ack_desired_version < desired.version:
             self.state.sync_status = SyncStatus.CONFLICTED
             return
+        if ack_desired_version > desired.version:
+            # 确认的是已被撤销/被更新取代的版本：该确认已作废，结论保持不变
+            return
         conflicting, details = _values_conflict(desired.values, reported.values)
         if conflicting:
             self.state.sync_status = SyncStatus.CONFLICTED
             return
+        # 正确确认当前版本：记录"最近一次已确认生效"的期望并停止计时。
+        # 即使此前已经判过 ACK_TIMEOUT，迟到的正确确认也会把结论纠正为 IN_SYNC。
         self.state.sync_status = SyncStatus.IN_SYNC
+        self._confirmed_desired = replace(desired)
+        self._ack_deadline_ms = None
 
     def conflict_detail(self) -> str:
         """返回当前冲突的可解释明细；未冲突时返回空串。"""
@@ -149,6 +193,7 @@ class DeviceTwin:
         expected_version: int | None,
         now_ms: int,
         merge: bool = True,
+        ack_timeout_ms: int | None = None,
     ) -> TwinState:
         with self._lock:
             current = self.state.desired
@@ -179,7 +224,133 @@ class DeviceTwin:
             # 新期望下发后：若设备在线则等待其对账；离线则保持 PENDING。
             # 已有的 CONFLICTED 结论被新期望重置，等待重新对账。
             self.state.sync_status = SyncStatus.PENDING
+            # 确认时限：只有设定了时长且设备在线时才从下发时刻起算；
+            # 设备离线时只记下时长，等重新上线那一刻再开始计时。
+            self._ack_timeout_ms = ack_timeout_ms if ack_timeout_ms is not None else None
+            if ack_timeout_ms is not None and self.state.connection is ConnectionState.ONLINE:
+                self._ack_deadline_ms = now_ms + ack_timeout_ms
+            else:
+                self._ack_deadline_ms = None
             return self.snapshot()
+
+    # ---- 确认时限 ----
+    def evaluate_ack_deadline(self, now_ms: int) -> SyncStatus:
+        """惰性检查挂起期望是否超过确认时限；超时则给出 ACK_TIMEOUT。
+
+        超时是一个可被后续正确确认自动纠正的中间结论：它只在当前仍为
+        PENDING（即设备既没确认、也没报出键值/版本冲突）时成立。
+        """
+        with self._lock:
+            return self._evaluate_ack_deadline_locked(now_ms)
+
+    def _evaluate_ack_deadline_locked(self, now_ms: int) -> SyncStatus:
+        """调用方须持锁。"""
+        if (
+            self._ack_deadline_ms is not None
+            and self.state.desired is not None
+            and self.state.sync_status is SyncStatus.PENDING
+            and now_ms >= self._ack_deadline_ms
+        ):
+            self.state.sync_status = SyncStatus.ACK_TIMEOUT
+        return self.state.sync_status
+
+    def ack_deadline(self) -> int | None:
+        with self._lock:
+            return self._ack_deadline_ms
+
+    # ---- 撤销 ----
+    def rollback_desired(
+        self,
+        now_ms: int,
+        version: int | None = None,
+    ) -> RollbackOutcome:
+        """撤销一次尚未被确认的期望变更，回到上一次已确认取值。
+
+        规则：
+
+        * 只能撤销"当前挂起、尚未被确认"的期望；已确认生效的期望不允许
+          撤销（``ALREADY_CONFIRMED``），需要走一次新的下发去覆盖；
+        * 撤销不回收旧版本号，而是按单调递增另起一版承载回退后取值，
+          杜绝与迟到确认/并发下发的版本错乱；
+        * 对同一版本重复撤销直接返回首拍结论（``idempotent=True``），
+          不会多出一版、不会重复回退。
+        """
+        with self._lock:
+            current = self.state.desired
+            target_version = version if version is not None else (
+                current.version if current is not None else None
+            )
+            if target_version is None:
+                return RollbackOutcome(
+                    self.device_id, rolled_back=False,
+                    detail="当前没有任何期望状态，无需撤销",
+                )
+
+            # 幂等：该版本此前已撤销过 -> 原样返回，不再产生新版本
+            if target_version in self._rolled_back_versions:
+                restored_to = self._rolled_back_versions[target_version]
+                cur_version = current.version if current else None
+                return RollbackOutcome(
+                    self.device_id, rolled_back=True, idempotent=True,
+                    desired_version=cur_version,
+                    detail=f"期望 v{target_version} 已撤销过，回退到 v{restored_to}，重复撤销不产生新版本",
+                )
+
+            if current is None or current.version != target_version:
+                raise DomainError(
+                    ErrorCode.VERSION_CONFLICT,
+                    f"期望 v{target_version} 已不是当前挂起版本"
+                    f"（当前 v{current.version if current else None}），无法撤销",
+                )
+            if self.state.sync_status is SyncStatus.IN_SYNC:
+                raise DomainError(
+                    ErrorCode.ALREADY_CONFIRMED,
+                    f"期望 v{target_version} 已被设备确认生效，不允许撤销，请重新下发覆盖",
+                )
+
+            confirmed = self._confirmed_desired
+            new_version = current.version + 1
+            if confirmed is None:
+                # 此前从未确认过任何期望：撤销即清空期望
+                self.state.desired = None
+                self.state.sync_status = SyncStatus.PENDING
+                restored_to: int | None = None
+            else:
+                self.state.desired = replace(
+                    confirmed,
+                    version=new_version,
+                    updated_at_ms=now_ms,
+                    expected_version=None,
+                )
+                restored_to = new_version
+                # 回退后以最近一次上报重新对账：值仍相等则 IN_SYNC，
+                # 设备实际取值已漂移则 CONFLICTED；没有上报则 PENDING。
+                if self.state.reported is None:
+                    self.state.sync_status = SyncStatus.PENDING
+                else:
+                    conflicting, _ = _values_conflict(
+                        self.state.desired.values, self.state.reported.values
+                    )
+                    self.state.sync_status = (
+                        SyncStatus.CONFLICTED if conflicting else SyncStatus.IN_SYNC
+                    )
+                    if self.state.sync_status is SyncStatus.IN_SYNC:
+                        self._confirmed_desired = replace(self.state.desired)
+
+            self._rolled_back_versions[target_version] = restored_to
+            self._ack_deadline_ms = None
+            self._ack_timeout_ms = None
+            self.state.last_event_ms = now_ms
+            return RollbackOutcome(
+                self.device_id,
+                rolled_back=True,
+                desired_version=self.state.desired.version
+                if self.state.desired else None,
+                detail=(
+                    f"已撤销未确认的期望 v{target_version}，回到上一次已确认取值"
+                    + (f" v{restored_to}" if restored_to is not None else "（空）")
+                ),
+            )
 
     def mark_delivered(self, now_ms: int) -> None:
         """重连后把期望状态标记为已重发（仍为 PENDING，等待设备确认）。"""

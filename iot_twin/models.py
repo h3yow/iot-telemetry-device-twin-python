@@ -19,6 +19,8 @@ class SyncStatus(str, Enum):
     PENDING = "PENDING"
     IN_SYNC = "IN_SYNC"
     CONFLICTED = "CONFLICTED"
+    # 已下发并开始计时，但超过确认时限仍未收到设备确认
+    ACK_TIMEOUT = "ACK_TIMEOUT"
 
 
 class AlertState(str, Enum):
@@ -103,3 +105,44 @@ class Alert:
     detail: str = ""
     trigger_value: float | None = None
     error_code: str | None = None
+
+
+# 单台设备的期望下发结论（批量逐台结果复用同一组状态）
+class ItemStatus(str, Enum):
+    DELIVERED = "DELIVERED"          # 已下发（设备是否确认取决于后续对账）
+    REJECTED = "REJECTED"            # 未下发（原因见 reject_reason）
+
+
+@dataclass
+class BatchDesiredItem:
+    """批量下发中的一台设备：可带各自不同的键值。"""
+    device_id: str
+    values: dict = field(default_factory=dict)
+    expected_version: int | None = None
+    merge: bool = True
+
+
+@dataclass
+class BatchItemResult:
+    device_id: str
+    status: ItemStatus
+    desired_version: int | None = None
+    reject_reason: str | None = None
+    detail: str = ""
+
+
+@dataclass
+class BatchOperation:
+    batch_id: str
+    created_at_ms: int
+    results: list[BatchItemResult] = field(default_factory=list)
+
+
+@dataclass
+class RollbackOutcome:
+    """撤销一次未确认期望变更的结论。"""
+    device_id: str
+    rolled_back: bool
+    idempotent: bool = False
+    desired_version: int | None = None
+    detail: str = ""

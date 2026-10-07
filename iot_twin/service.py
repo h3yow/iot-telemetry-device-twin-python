@@ -15,15 +15,21 @@ import logging
 import threading
 
 from .alerts import AlertManager
+from .batch import BatchManager
 from .clock import Clock, SystemClock
 from .dedupe import DeduplicationWindow
 from .errors import DomainError, ErrorCode
 from .models import (
     Alert,
+    BatchDesiredItem,
+    BatchItemResult,
+    BatchOperation,
     Device,
     IngestResult,
+    ItemStatus,
     Principal,
     RejectReason,
+    RollbackOutcome,
     Role,
     SyncStatus,
     TelemetrySample,
@@ -53,6 +59,7 @@ class IoTService:
         self._twins: dict[str, DeviceTwin] = {}
         self.rules = RuleEngine()
         self.alerts = AlertManager()
+        self.batches = BatchManager()
         self._lock = threading.RLock()
 
     # ---- 内部访问器 ----
@@ -92,12 +99,15 @@ class IoTService:
         twin = self._twin(device_id)
         snapshot = twin.connect(now)
         twin.mark_delivered(now)
+        # 重连已在孪生内把确认时限从上线时刻重算；这里惰性复核一次
+        twin.evaluate_ack_deadline(now)
         log.info(
-            "设备上线 device_id=%s at=%s 期望版本=%s 同步状态=%s",
+            "设备上线 device_id=%s at=%s 期望版本=%s 同步状态=%s 确认时限=%s",
             device_id,
             now,
             snapshot.desired.version if snapshot.desired else None,
-            snapshot.sync_status.value,
+            twin.state.sync_status.value,
+            twin.ack_deadline(),
         )
         self._evaluate_connection_rules(device_id, now)
         return twin.snapshot()
@@ -114,7 +124,10 @@ class IoTService:
 
     def get_twin(self, principal: Principal, device_id: str) -> TwinState:
         self._authorize(principal, device_id)
-        return self._twin(device_id).snapshot()
+        twin = self._twin(device_id)
+        # 查询时惰性复核确认时限：无需后台定时器即可得到超时结论
+        twin.evaluate_ack_deadline(self.clock.now_ms())
+        return twin.snapshot()
 
     # ---- 遥测 ----
     def ingest_telemetry(
@@ -222,6 +235,7 @@ class IoTService:
         values: dict,
         expected_version: int | None = None,
         merge: bool = True,
+        ack_timeout_ms: int | None = None,
     ) -> TwinState:
         # 设备自身与管理员都可以查看，但下发期望属于管理操作：仅管理员
         if principal.role is not Role.ADMIN:
@@ -229,20 +243,142 @@ class IoTService:
                 ErrorCode.PERMISSION_DENIED,
                 "只有管理员可以下发期望状态",
             )
+        if not isinstance(values, dict) or not all(isinstance(k, str) for k in values):
+            raise DomainError(
+                ErrorCode.BAD_TELEMETRY,
+                "values 必须为以字符串为键的字典",
+            )
+        if ack_timeout_ms is not None and ack_timeout_ms <= 0:
+            raise DomainError(
+                ErrorCode.BAD_TELEMETRY,
+                "ack_timeout_ms 必须为正数",
+            )
         self.registry.get(device_id)
         now = self.clock.now_ms()
         twin = self._twin(device_id)
-        snapshot = twin.update_desired(values, expected_version, now, merge=merge)
+        snapshot = twin.update_desired(
+            values, expected_version, now, merge=merge,
+            ack_timeout_ms=ack_timeout_ms,
+        )
+        # 边界：下发时刻恰好已到时限的极端情况也惰性复核一次
+        twin.evaluate_ack_deadline(now)
         log.info(
-            "期望状态下发 device_id=%s 版本=v%s merge=%s 连接=%s 同步=%s values=%s",
+            "期望状态下发 device_id=%s 版本=v%s merge=%s 连接=%s 同步=%s 时限=%s values=%s",
             device_id,
             snapshot.desired.version if snapshot.desired else 0,
             merge,
             snapshot.connection.value,
-            snapshot.sync_status.value,
+            twin.state.sync_status.value,
+            twin.ack_deadline(),
             values,
         )
-        return snapshot
+        return twin.snapshot()
+
+    def rollback_desired(
+        self,
+        principal: Principal,
+        device_id: str,
+        version: int | None = None,
+    ) -> RollbackOutcome:
+        """撤销一次尚未被设备确认的期望变更（管理员操作，幂等）。"""
+        if principal.role is not Role.ADMIN:
+            raise DomainError(
+                ErrorCode.PERMISSION_DENIED,
+                "只有管理员可以撤销期望状态",
+            )
+        self.registry.get(device_id)
+        now = self.clock.now_ms()
+        twin = self._twin(device_id)
+        outcome = twin.rollback_desired(now, version=version)
+        log.info(
+            "期望状态撤销 device_id=%s 指定版本=%s 是否撤销=%s 幂等=%s 当前版本=%s 依据=%s",
+            device_id, version, outcome.rolled_back, outcome.idempotent,
+            outcome.desired_version, outcome.detail,
+        )
+        return outcome
+
+    def batch_update_desired(
+        self,
+        principal: Principal,
+        batch_id: str,
+        items: list[BatchDesiredItem],
+    ) -> BatchOperation:
+        """批量下发期望状态：逐台隔离、batch_id 幂等、结论可查。
+
+        每台设备各自独立鉴权/校验/下发，一台被拒绝不影响其它设备；
+        对同一 ``batch_id`` 的相同重试直接返回首拍结论，不重复下发、
+        不造成版本乱跳。
+        """
+        if principal.role is not Role.ADMIN:
+            raise DomainError(
+                ErrorCode.PERMISSION_DENIED,
+                "只有管理员可以批量下发期望状态",
+            )
+        now = self.clock.now_ms()
+
+        def dispatch_one(item: BatchDesiredItem) -> BatchItemResult:
+            # 单台内部复用单台下发的全部校验与并发规则；
+            # DomainError 由 BatchManager 归一化为逐台 REJECTED。
+            self.registry.get(item.device_id)
+            twin = self._twin(item.device_id)
+            snapshot = twin.update_desired(
+                item.values, item.expected_version, now, merge=item.merge
+            )
+            twin.evaluate_ack_deadline(now)
+            return BatchItemResult(
+                device_id=item.device_id,
+                status=ItemStatus.DELIVERED,
+                desired_version=snapshot.desired.version if snapshot.desired else None,
+                detail="已下发，等待设备确认",
+            )
+
+        operation = self.batches.get_or_dispatch(batch_id, items, now, dispatch_one)
+        delivered = sum(r.status is ItemStatus.DELIVERED for r in operation.results)
+        log.info(
+            "批量期望下发 batch_id=%s 总台数=%s 成功=%s 失败=%s 逐台=%s",
+            batch_id, len(operation.results), delivered,
+            len(operation.results) - delivered,
+            [(r.device_id, r.status.value, r.reject_reason) for r in operation.results],
+        )
+        return operation
+
+    def get_batch(self, principal: Principal, batch_id: str) -> BatchOperation:
+        """查询一批操作的逐台首拍结论。"""
+        if principal.role is not Role.ADMIN:
+            raise DomainError(ErrorCode.PERMISSION_DENIED, "只有管理员可以查询批量操作")
+        operation = self.batches.get(batch_id)
+        if operation is None:
+            raise DomainError(ErrorCode.BATCH_NOT_FOUND, f"批次 {batch_id} 不存在")
+        return operation
+
+    def batch_device_status(
+        self, principal: Principal, batch_id: str
+    ) -> list[BatchItemResult]:
+        """查询一批操作各设备的最新逐台结论（含后续确认/超时演进）。
+
+        首拍成功的设备会附带当前对账结论（PENDING / IN_SYNC / CONFLICTED /
+        ACK_TIMEOUT），被拒设备保持首拍拒绝原因。
+        """
+        operation = self.get_batch(principal, batch_id)
+        now = self.clock.now_ms()
+        latest: list[BatchItemResult] = []
+        for result in operation.results:
+            if result.status is not ItemStatus.DELIVERED:
+                latest.append(result)
+                continue
+            twin = self._twin(result.device_id)
+            status = twin.evaluate_ack_deadline(now)
+            latest.append(
+                BatchItemResult(
+                    device_id=result.device_id,
+                    status=ItemStatus.DELIVERED,
+                    desired_version=(
+                        twin.state.desired.version if twin.state.desired else None
+                    ),
+                    detail=f"已下发，当前对账结论={status.value}",
+                )
+            )
+        return latest
 
     # ---- 规则与告警 ----
     def add_rule(self, principal: Principal, rule: Rule) -> None:

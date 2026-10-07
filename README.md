@@ -17,7 +17,8 @@ iot_twin/
   registry.py  设备注册、凭证鉴权、权限校验
   dedupe.py    按设备+seq 的有界幂等去重窗口
   telemetry.py 遥测汇聚：(ts_ms, seq) 水位、latest-wins、批量排序并入
-  twin.py      设备孪生：期望/上报分离、乐观锁、重连对账、冲突判定
+  twin.py      设备孪生：期望/上报分离、乐观锁、重连对账、冲突判定、确认时限、撤销
+  batch.py     批量期望下发：逐台隔离、batch_id 幂等、首拍/最新结论可查
   rules.py     规则：数值阈值（GT/GTE/LT/LTE/EQ）与连接状态
   alerts.py    告警状态机：FIRING / RESOLVED / ERROR，去重恢复、事件时间防倒退
   service.py   门面编排（推荐入口）
@@ -76,14 +77,76 @@ uv run python main.py      # 可选：启动本地 HTTP 服务（127.0.0.1:8080�
   `merge=True` 为补丁合并，`merge=False` 为整体替换。
 * **离线期间下发**：设备离线时期望状态为 `PENDING`；重连后保持挂起并等待设备带
   `ack_desired_version` 的上报对账。
+* **确认时限与超时结论**：下发期望时可选传 `ack_timeout_ms`（毫秒，正整数）：
+  * **设备在线时下发**：时限从**下发时刻**开始算；
+  * **设备离线期间下发**：离线不计时，时限从设备**重新上线那一刻**开始算
+    （重连后 `deadline = 上线时刻 + ack_timeout_ms`），设备不会刚上线就被判超时；
+  * 到达时限仍未收到确认，对账结论变为独立的 **`ACK_TIMEOUT`**（超时没确认），
+    它与下面两类冲突结论严格可区分：
+    - `CONFLICTED`（设备按老版本执行，`ack < 当前期望版本`）；
+    - `CONFLICTED`（取值对不上，`ack` 版本一致但键值不一致，见 `conflict_detail()`）。
+  * 超时不是终态：时限之后设备把**正确的确认**补上来，结论会**自动纠正**为
+    `IN_SYNC`；补上来的是错误取值/老版本确认，则纠正为 `CONFLICTED`，不会一直
+    卡在超时上。超时判定是**惰性**的（查询孪生、遥测到达、上下线、批次查询时复核），
+    不依赖后台定时器。撤销期望或设备离线时计时停止。
 * **确定性对账结论**（`SyncStatus`）：
   * `IN_SYNC`：`ack == 当前期望版本` 且期望值逐键都出现在上报中且值相等；
   * `CONFLICTED`：`ack < 当前期望版本`（设备按旧期望执行），或任一键值不一致；
     `conflict_detail()` 给出逐键的 `desired vs reported` 明细；
-  * `PENDING`：尚无期望/上报、或设备尚未确认新期望。
+  * `ACK_TIMEOUT`：已下发并开始计时，但超过确认时限仍未确认（且尚未出现冲突）；
+  * `PENDING`：尚无期望/上报、设备尚未确认新期望，或尚未设定确认时限。
   * 设备不带 `ack` 的普通遥测**不会**把已有的 `IN_SYNC` 结论打回（状态不无故回退）；
     每次下发新期望才会重置为 `PENDING` 等待重新对账。
 * 上报状态同样按 `(ts_ms, seq)` 水位并入，过期上报不会倒退孪生。
+
+## 撤销未确认的期望变更（下发—确认—收尾）
+
+运维发错期望时，可以**撤销一次还没被设备确认的期望变更**
+（`rollback_desired(principal, device_id, version=None)`，HTTP 为
+`POST /admin/desired/{device_id}/rollback`，仅管理员）：
+
+* **回退目标**：撤销后回到这次变更**之前最后一次已被确认过的取值**；如果此前从未
+  确认过任何期望，则清空期望（回到无期望状态）。
+* **版本规则**：撤销不回收旧版本号，而是按单调递增**另起一版**承载回退后取值
+  （例如 v1 已确认、v2 挂起被撤，则回退值记为 v3），因此迟到的 v2 确认（`ack=2 < 3`）
+  不可能与当前版本混淆，杜绝版本错乱与取值无故回退。
+* **幂等**：对同一版本重复撤销直接返回首拍结论（`idempotent=true`），不会多出一版、
+  不会重复回退；不带 `version` 时撤销当前挂起版本。
+* **已确认生效不可撤**：当前挂起期望已是 `IN_SYNC` 时撤销返回 `ALREADY_CONFIRMED`，
+  必须走一次新的下发去覆盖。撤销已被更新下发取代的版本返回 `VERSION_CONFLICT`。
+* **并发安全**：撤销、新下发、设备确认都在同一把孪生锁内串行，配合
+  `expected_version` 乐观锁：撤销与新下发竞争时要么撤销先生效后下发重试成功，
+  要么新下发先生效后撤销被 `VERSION_CONFLICT` 拒绝，不丢更新；设备先确认后撤销则被
+  `ALREADY_CONFIRMED` 拒绝。撤销后孪生会以最近一次上报重新对账（值仍相等为
+  `IN_SYNC`，设备取值已漂移为 `CONFLICTED`）。
+
+## 批量期望下发
+
+`batch_update_desired(principal, batch_id, items)`（HTTP 为
+`POST /admin/desired-batch`，仅管理员）支持一次给几十台设备下发，每台可带各自不同的
+键值、`expected_version` 与 `merge` 策略：
+
+* **逐台隔离**：每台独立校验/下发。未注册、凭证/权限问题、`VERSION_CONFLICT`、
+  载荷非法只让该台失败（结果中 `status=REJECTED` + 可区分的 `reject_reason`），
+  **不影响同批其它设备**；成功设备 `status=DELIVERED` 并带上下发后的期望版本。
+* **调用幂等**：以调用方提供的 `batch_id` 为幂等键。相同 `batch_id` + 相同内容的
+  重试直接返回首拍结论，**不重复下发、不造成版本乱跳**（响应中的 `created_at_ms`
+  保持首拍时间）；同一 `batch_id` 换了内容则返回 `IDEMPOTENCY_KEY_REUSED`，避免
+  幂等键挪用。空批次返回 `EMPTY_BATCH`。
+* **结论可查**：`get_batch(batch_id)` 返回该批的逐台**首拍结论与原因**；
+  `batch_device_status(batch_id)`（HTTP `GET /admin/desired-batch/{batch_id}` 的
+  `latest` 字段）返回各设备**最新对账结论**（含后续 `IN_SYNC` / `ACK_TIMEOUT` /
+  `CONFLICTED` 演进）；不存在的批次返回 `BATCH_NOT_FOUND`。
+
+## 对现有单台下发行为的兼容范围
+
+* `update_desired` 的 `values / expected_version / merge` 语义与版本推进规则完全不变；
+  新增的 `ack_timeout_ms` 是**可选关键字参数**，不传时与旧行为一致——永远不会被判
+  `ACK_TIMEOUT`，老调用方无需改动。
+* 原有 `SyncStatus.PENDING / IN_SYNC / CONFLICTED` 语义保持不变，仅新增
+  `ACK_TIMEOUT` 一个枚举值；不带确认时限的既有流程看不到新结论。
+* 撤销与批量是**新增**服务方法与 HTTP 端点，不改变注册鉴权、遥测去重/乱序补传、
+  对账与告警链路的任何既有判定。
 
 ## 规则与告警规则
 
@@ -102,7 +165,7 @@ uv run python main.py      # 可选：启动本地 HTTP 服务（127.0.0.1:8080�
 ## 本地验证方法
 
 ```bash
-uv run pytest -q          # 27 个用例，含乱序补传/重复上报/重连/并发
+uv run pytest -q          # 50 个用例（含 -s 可打印判定日志）
 uv run python examples/demo.py
 ```
 
@@ -114,7 +177,13 @@ uv run python examples/demo.py
 * 离线期望下发、重连后生效、键值冲突/版本冲突的确定性结论（`test_twin.py`）；
 * 16 线程并发期望更新 + 乐观版本重试，无丢失更新（`test_twin.py`、`test_service.py`）；
 * 告警触发去重、恢复、再触发、乱序防倒退、异常归一化、离线自动恢复（`test_alerts.py`）；
-* HTTP 层拒绝码可区分（`tests/test_app.py`，使用 TestClient，不绑定端口）。
+* **确认时限前后结论、超时后迟到正确/错误确认的自动纠正、老版本确认与超时的区分、
+  离线期间下发时限从重连起算、不设时限永不超时**（`tests/test_deadline.py`）；
+* **撤销回退到上一次已确认取值、重复撤销幂等、已确认不可撤、撤销与新下发/设备确认
+  并发不乱**（`tests/test_rollback.py`）；
+* **批量部分失败逐台隔离、相同请求重试幂等不跳版本、幂等键挪用被拒、批次首拍与
+  最新结论查询**（`tests/test_batch.py`）；
+* HTTP 层拒绝码、批量与撤销端点可区分（`tests/test_app.py`，使用 TestClient，不绑定端口）。
 
 单测通过 `tests/conftest.py` 配置的 logger 向 stdout 打印**输入、判定依据与最终状态**，
 例如：
