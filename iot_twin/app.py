@@ -45,6 +45,25 @@ class DesiredIn(BaseModel):
     values: dict[str, Any]
     expected_version: int | None = None
     merge: bool = True
+    ack_timeout_ms: int | None = None
+
+
+class RevokeIn(BaseModel):
+    expected_version: int | None = None
+
+
+class BatchDesiredIn(BaseModel):
+    device_id: str
+    values: dict[str, Any]
+    expected_version: int | None = None
+    merge: bool = True
+    ack_timeout_ms: int | None = None
+
+
+class BatchIn(BaseModel):
+    items: list[BatchDesiredIn]
+    batch_id: str | None = None
+    idempotency_key: str | None = None
 
 
 class RuleIn(BaseModel):
@@ -109,8 +128,59 @@ def create_app() -> FastAPI:
         twin = svc.update_desired(
             admin, device_id, body.values,
             expected_version=body.expected_version, merge=body.merge,
+            ack_timeout_ms=body.ack_timeout_ms,
         )
         return _twin_dict(twin)
+
+    @app.post("/admin/desired/{device_id}/revoke")
+    def revoke_desired(
+        device_id: str, body: RevokeIn, admin: Principal = Depends(admin_principal)
+    ) -> dict:
+        try:
+            twin = svc.revoke_desired(
+                admin, device_id, expected_version=body.expected_version
+            )
+        except DomainError as exc:
+            status = _status_for(exc.code)
+            raise HTTPException(
+                status_code=status, detail={"error_code": exc.code, "message": exc.message}
+            )
+        return _twin_dict(twin)
+
+    @app.post("/admin/desired-batch")
+    def dispatch_batch(body: BatchIn, admin: Principal = Depends(admin_principal)) -> dict:
+        from .models import BatchDesiredItem
+
+        items = [
+            BatchDesiredItem(
+                device_id=i.device_id,
+                values=i.values,
+                expected_version=i.expected_version,
+                merge=i.merge,
+                ack_timeout_ms=i.ack_timeout_ms,
+            )
+            for i in body.items
+        ]
+        try:
+            record = svc.dispatch_batch(
+                admin, items, batch_id=body.batch_id, idempotency_key=body.idempotency_key
+            )
+        except DomainError as exc:
+            raise HTTPException(
+                status_code=_status_for(exc.code),
+                detail={"error_code": exc.code, "message": exc.message},
+            )
+        return _batch_dict(record)
+
+    @app.get("/admin/desired-batch/{batch_id}")
+    def get_batch(batch_id: str, admin: Principal = Depends(admin_principal)) -> dict:
+        try:
+            record = svc.get_batch(admin, batch_id)
+        except DomainError as exc:
+            raise HTTPException(
+                status_code=404, detail={"error_code": exc.code, "message": exc.message}
+            )
+        return _batch_dict(record)
 
     @app.get("/admin/alerts/{device_id}")
     def get_alerts(device_id: str, admin: Principal = Depends(admin_principal)) -> dict:
@@ -167,6 +237,17 @@ def create_app() -> FastAPI:
     return app
 
 
+def _status_for(code: str) -> int:
+    if code in (ErrorCode.VERSION_CONFLICT, ErrorCode.ALREADY_CONFIRMED,
+                ErrorCode.STATE_CONFLICT):
+        return 409
+    if code == ErrorCode.INVALID_REQUEST:
+        return 400
+    if code == ErrorCode.PERMISSION_DENIED:
+        return 403
+    return 422
+
+
 def _twin_dict(twin: Any) -> dict:
     return {
         "device_id": twin.device_id,
@@ -174,7 +255,11 @@ def _twin_dict(twin: Any) -> dict:
         "sync_status": twin.sync_status.value,
         "desired": (
             {"version": twin.desired.version, "values": twin.desired.values,
-             "updated_at_ms": twin.desired.updated_at_ms}
+             "updated_at_ms": twin.desired.updated_at_ms,
+             "ack_timeout_ms": twin.desired.ack_timeout_ms,
+             "deadline_ms": twin.desired.deadline_ms,
+             "revoke_of_version": twin.desired.revoke_of_version,
+             "confirmed": twin.desired.confirmed}
             if twin.desired else None
         ),
         "reported": (
@@ -182,6 +267,25 @@ def _twin_dict(twin: Any) -> dict:
              "updated_at_ms": twin.reported.updated_at_ms, "last_seq": twin.reported.last_seq}
             if twin.reported else None
         ),
+    }
+
+
+def _batch_dict(record: Any) -> dict:
+    return {
+        "batch_id": record.batch_id,
+        "created_at_ms": record.created_at_ms,
+        "idempotency_key": record.idempotency_key,
+        "items": [
+            {
+                "device_id": i.device_id,
+                "status": i.status.value if hasattr(i.status, "value") else i.status,
+                "desired_version": i.desired_version,
+                "reject_reason": i.reject_reason,
+                "detail": i.detail,
+                "current_sync_status": i.current_sync_status,
+            }
+            for i in record.items
+        ],
     }
 
 

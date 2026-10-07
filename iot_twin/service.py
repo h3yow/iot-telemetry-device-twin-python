@@ -13,13 +13,19 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 
 from .alerts import AlertManager
 from .clock import Clock, SystemClock
 from .dedupe import DeduplicationWindow
+from .dispatch import BatchDispatcher
 from .errors import DomainError, ErrorCode
 from .models import (
     Alert,
+    BatchDesiredItem,
+    BatchItemResult,
+    BatchItemStatus,
+    BatchRecord,
     Device,
     IngestResult,
     Principal,
@@ -53,6 +59,7 @@ class IoTService:
         self._twins: dict[str, DeviceTwin] = {}
         self.rules = RuleEngine()
         self.alerts = AlertManager()
+        self.batches = BatchDispatcher()
         self._lock = threading.RLock()
 
     # ---- 内部访问器 ----
@@ -114,7 +121,10 @@ class IoTService:
 
     def get_twin(self, principal: Principal, device_id: str) -> TwinState:
         self._authorize(principal, device_id)
-        return self._twin(device_id).snapshot()
+        twin = self._twin(device_id)
+        with twin._lock:
+            twin.evaluate_timeout(self.clock.now_ms())
+            return twin.snapshot()
 
     # ---- 遥测 ----
     def ingest_telemetry(
@@ -179,9 +189,10 @@ class IoTService:
             dict(metrics), seq, ts_ms, now, ack_desired_version=ack_desired_version
         )
         log.info(
-            "遥测计入 device_id=%s seq=%s ts=%s metrics=%s 对账=%s 依据=%s 冲突明细=%s",
+            "遥测计入 device_id=%s seq=%s ts=%s metrics=%s 对账=%s 依据=%s 冲突明细=%s 超时明细=%s",
             device_id, seq, ts_ms, metrics, sync_status.value, reason,
             twin.conflict_detail() if sync_status is SyncStatus.CONFLICTED else "",
+            twin.timeout_detail() if sync_status is SyncStatus.ACK_TIMEOUT else "",
         )
 
         # 4) 规则与告警（仅被计入的新样本触发）
@@ -222,6 +233,7 @@ class IoTService:
         values: dict,
         expected_version: int | None = None,
         merge: bool = True,
+        ack_timeout_ms: int | None = None,
     ) -> TwinState:
         # 设备自身与管理员都可以查看，但下发期望属于管理操作：仅管理员
         if principal.role is not Role.ADMIN:
@@ -232,17 +244,130 @@ class IoTService:
         self.registry.get(device_id)
         now = self.clock.now_ms()
         twin = self._twin(device_id)
-        snapshot = twin.update_desired(values, expected_version, now, merge=merge)
+        snapshot = twin.update_desired(
+            values, expected_version, now,
+            merge=merge, ack_timeout_ms=ack_timeout_ms,
+        )
         log.info(
-            "期望状态下发 device_id=%s 版本=v%s merge=%s 连接=%s 同步=%s values=%s",
+            "期望状态下发 device_id=%s 版本=v%s merge=%s 时限ms=%s deadline=%s "
+            "连接=%s 同步=%s values=%s",
             device_id,
             snapshot.desired.version if snapshot.desired else 0,
             merge,
+            ack_timeout_ms,
+            snapshot.desired.deadline_ms if snapshot.desired else None,
             snapshot.connection.value,
             snapshot.sync_status.value,
             values,
         )
         return snapshot
+
+    def revoke_desired(
+        self,
+        principal: Principal,
+        device_id: str,
+        expected_version: int | None = None,
+    ) -> TwinState:
+        """撤销该设备尚未确认的期望变更（管理员操作）。"""
+        if principal.role is not Role.ADMIN:
+            raise DomainError(
+                ErrorCode.PERMISSION_DENIED,
+                "只有管理员可以撤销期望状态",
+            )
+        self.registry.get(device_id)
+        now = self.clock.now_ms()
+        twin = self._twin(device_id)
+        before = twin.state.desired.version if twin.state.desired else None
+        snapshot = twin.revoke_desired(now, expected_version=expected_version)
+        after = snapshot.desired.version if snapshot.desired else None
+        log.info(
+            "期望状态撤销 device_id=%s 撤销前版本=v%s 撤销后版本=%s 同步=%s",
+            device_id, before, after, snapshot.sync_status.value,
+        )
+        return snapshot
+
+    # ---- 批量下发 ----
+    def dispatch_batch(
+        self,
+        principal: Principal,
+        items: list[BatchDesiredItem],
+        *,
+        batch_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> BatchRecord:
+        """一次给一批设备下发期望；逐台独立出结果，单台失败不影响其它。
+
+        相同 ``idempotency_key`` 重复提交返回首次批次，不重复下发、版本不乱跳。
+        """
+        if principal.role is not Role.ADMIN:
+            raise DomainError(
+                ErrorCode.PERMISSION_DENIED,
+                "只有管理员可以批量下发期望状态",
+            )
+        # 批次整体合法性先校验（空批次 / 批次内重复设备）
+        BatchDispatcher._validate(items)
+        # 所有设备须已注册（逐台结论里体现，不在这里整批拒绝）；实际逐台执行时判定
+        now = self.clock.now_ms()
+        resolved_batch_id = batch_id or f"batch-{uuid.uuid4().hex}"
+
+        def _dispatch_one(item: BatchDesiredItem) -> BatchItemResult:
+            return self._dispatch_one(principal, item)
+
+        record = self.batches.submit(
+            resolved_batch_id, items, now, idempotency_key, _dispatch_one
+        )
+        record = self._fill_current_status(record)
+        accepted = sum(1 for i in record.items if i.status is BatchItemStatus.DISPATCHED)
+        log.info(
+            "批量下发完成 batch_id=%s 幂等键=%s 总数=%s 成功=%s 失败=%s 明细=%s",
+            record.batch_id, idempotency_key, len(record.items),
+            accepted, len(record.items) - accepted,
+            [(i.device_id, i.status.value, i.reject_reason) for i in record.items],
+        )
+        return record
+
+    def _dispatch_one(
+        self, principal: Principal, item: BatchDesiredItem
+    ) -> BatchItemResult:
+        """逐台下发：任何单台失败都收敛为 REJECTED 结论，不抛出。"""
+        # update_desired 内部先查注册/权限，未注册不会提前造出空孪生
+        snapshot = self.update_desired(
+            principal,
+            item.device_id,
+            dict(item.values),
+            expected_version=item.expected_version,
+            merge=item.merge,
+            ack_timeout_ms=item.ack_timeout_ms,
+        )
+        return BatchItemResult(
+            device_id=item.device_id,
+            status=BatchItemStatus.DISPATCHED,
+            desired_version=snapshot.desired.version if snapshot.desired else None,
+            current_sync_status=snapshot.sync_status.value,
+        )
+
+    def get_batch(self, principal: Principal, batch_id: str) -> BatchRecord:
+        """查询一批操作最终的逐台结论与原因（管理员）。"""
+        if principal.role is not Role.ADMIN:
+            raise DomainError(
+                ErrorCode.PERMISSION_DENIED,
+                "只有管理员可以查询批量下发结果",
+            )
+        record = self.batches.get(batch_id)
+        return self._fill_current_status(record)
+
+    def _fill_current_status(self, record: BatchRecord) -> BatchRecord:
+        """为批次中每台成功下发的设备回填当前对账结论（含超时纠正后的最新值）。"""
+        for item in record.items:
+            if item.status is not BatchItemStatus.DISPATCHED:
+                continue
+            twin = self._twins.get(item.device_id)
+            if twin is None:
+                continue
+            with twin._lock:
+                twin.evaluate_timeout(self.clock.now_ms())
+                item.current_sync_status = twin.state.sync_status.value
+        return record
 
     # ---- 规则与告警 ----
     def add_rule(self, principal: Principal, rule: Rule) -> None:

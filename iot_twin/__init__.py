@@ -10,5 +10,6 @@ __all__ = [
     "twin",
     "rules",
     "alerts",
+    "dispatch",
     "service",
 ]

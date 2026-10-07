@@ -15,6 +15,12 @@ class ErrorCode:
     STATE_CONFLICT = "STATE_CONFLICT"
     VERSION_CONFLICT = "VERSION_CONFLICT"
     RULE_EVALUATION_ERROR = "RULE_EVALUATION_ERROR"
+    # 撤销一个已经被设备确认生效的期望版本
+    ALREADY_CONFIRMED = "ALREADY_CONFIRMED"
+    # 批量请求本身不合法（空批次 / 批次内重复设备）
+    INVALID_REQUEST = "INVALID_REQUEST"
+    # 批次不存在
+    BATCH_NOT_FOUND = "BATCH_NOT_FOUND"
 
 
 class DomainError(Exception):

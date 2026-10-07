@@ -73,3 +73,70 @@ def test_http_register_auth_telemetry_and_rejection_codes():
     twin = client.get("/devices/dev-1/twin", headers=headers).json()
     assert twin["sync_status"] == "IN_SYNC"
     log.info("输入: 设备确认期望 v1; 最终孪生=%s", twin)
+
+
+def test_http_desired_with_timeout_revoke_and_batch_endpoints():
+    client = _client()
+    admin = {"Authorization": "Bearer admin"}
+
+    client.post("/admin/devices", json={"device_id": "dev-1", "credential": "s1"}, headers=admin)
+    client.post("/admin/devices", json={"device_id": "dev-2", "credential": "s2"}, headers=admin)
+    h1 = {"Authorization": "Bearer s1"}
+    client.post("/devices/dev-1/connection", json={"online": True}, headers=h1)
+
+    # 下发带确认时限的期望（时钟为系统时钟，只验证字段透传与状态结构）
+    r = client.post(
+        "/admin/desired/dev-1",
+        json={"values": {"led": "on"}, "ack_timeout_ms": 500},
+        headers=admin,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["desired"]["ack_timeout_ms"] == 500
+    assert body["desired"]["deadline_ms"] is not None
+    assert body["sync_status"] == "PENDING"
+    log.info("输入: HTTP 下发带时限期望; 结论=%s", body["sync_status"])
+
+    # 批量下发：dev-1 成功、ghost 未注册被拒（互不影响），查询逐台结论
+    r = client.post(
+        "/admin/desired-batch",
+        json={"idempotency_key": "k-1", "items": [
+            {"device_id": "dev-1", "values": {"led": "blink"}},
+            {"device_id": "ghost", "values": {"led": "on"}},
+        ]},
+        headers=admin,
+    )
+    assert r.status_code == 200
+    batch = r.json()
+    by_dev = {i["device_id"]: i for i in batch["items"]}
+    assert by_dev["dev-1"]["status"] == "DISPATCHED"
+    assert by_dev["ghost"]["status"] == "REJECTED"
+    assert by_dev["ghost"]["reject_reason"] == "DEVICE_NOT_REGISTERED"
+    log.info("输入: HTTP 批量含坏设备; 逐台=%s",
+             [(d, i["status"], i["reject_reason"]) for d, i in by_dev.items()])
+
+    # 幂等重试：同键返回同 batch_id，版本不乱跳
+    r2 = client.post(
+        "/admin/desired-batch",
+        json={"idempotency_key": "k-1", "items": [{"device_id": "dev-2", "values": {"x": 1}}]},
+        headers=admin,
+    )
+    assert r2.json()["batch_id"] == batch["batch_id"]
+
+    # 批次查询
+    got = client.get(f"/admin/desired-batch/{batch['batch_id']}", headers=admin)
+    assert got.status_code == 200 and len(got.json()["items"]) == 2
+    missing = client.get("/admin/desired-batch/nope", headers=admin)
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["error_code"] == "BATCH_NOT_FOUND"
+
+    # 撤销一个尚未确认的期望
+    r = client.post("/admin/desired/dev-2", json={"values": {"led": "on"}}, headers=admin)
+    rev = client.post("/admin/desired/dev-2/revoke", json={}, headers=admin)
+    assert rev.status_code == 200
+    assert rev.json()["desired"] is None
+    log.info("输入: HTTP 撤销 dev-2 首次未确认期望; 最终 desired=%s", rev.json()["desired"])
+
+    # 空批次 -> 400 INVALID_REQUEST
+    r = client.post("/admin/desired-batch", json={"items": []}, headers=admin)
+    assert r.status_code == 400 and r.json()["detail"]["error_code"] == "INVALID_REQUEST"

@@ -82,6 +82,56 @@ def main() -> None:
     svc.ingest_telemetry(device, "sensor-A", seq=6, ts_ms=6000, metrics={"temp": 20.0})
     show("降温后活动告警", svc.list_alerts(admin, "sensor-A"))
 
+    # 7. 运营链路：确认时限 / 超时纠正 / 撤销 / 批量下发
+    svc.register_device("sensor-B", "cred-B")
+    dev_b = svc.authenticate("sensor-B", "cred-B")
+
+    # 7.1 离线期间下发带时限期望：重连后才开始计时
+    twin = svc.update_desired(admin, "sensor-B", {"led": "on"}, ack_timeout_ms=2000)
+    show("离线下发（时限未激活）",
+         (twin.sync_status.value, twin.desired.deadline_ms))
+    svc.connect(dev_b, "sensor-B")
+    show("重连后 deadline 激活", svc.get_twin(admin, "sensor-B").desired.deadline_ms)
+
+    # 7.2 越过时限 -> ACK_TIMEOUT；迟到的正确确认 -> 自动纠正为 IN_SYNC
+    clock.advance(2001)
+    show("超时未确认", svc.get_twin(admin, "sensor-B").sync_status.value)
+    svc.ingest_telemetry(
+        dev_b, "sensor-B", seq=1, ts_ms=clock.now_ms(),
+        metrics={"led": "on"}, ack_desired_version=1,
+    )
+    show("迟到正确确认后", svc.get_twin(admin, "sensor-B").sync_status.value)
+
+    # 7.3 撤销一次未确认变更：回到最后确认取值，版本仍前进
+    svc.update_desired(admin, "sensor-B", {"led": "blink"}, expected_version=1)
+    revoked = svc.revoke_desired(admin, "sensor-B")
+    revoked_again = svc.revoke_desired(admin, "sensor-B")
+    show("撤销未确认变更（幂等）", {
+        "values": revoked.desired.values,
+        "version": revoked.desired.version,
+        "revoke_of_version": revoked.desired.revoke_of_version,
+        "repeat_version": revoked_again.desired.version,
+    })
+
+    # 7.4 批量下发：部分失败隔离 + 幂等重试 + 逐台结论查询
+    svc.register_device("sensor-C", "cred-C")
+    from iot_twin.models import BatchDesiredItem
+
+    batch_items = [
+        BatchDesiredItem("sensor-B", {"power": 1}),
+        BatchDesiredItem("ghost", {"power": 1}),                    # 未注册 -> 拒绝
+        BatchDesiredItem("sensor-C", {"power": 2}, expected_version=99),  # 版本不符
+    ]
+    record = svc.dispatch_batch(admin, batch_items, idempotency_key="ops-1")
+    show("批量逐台结论",
+         [(i.device_id, i.status.value, i.reject_reason) for i in record.items])
+    retry = svc.dispatch_batch(
+        admin, [BatchDesiredItem("sensor-B", {"power": 999})], idempotency_key="ops-1"
+    )
+    show("同幂等键重试（返回同批次，不重复下发）",
+         (retry.batch_id == record.batch_id,
+          svc.get_twin(admin, "sensor-B").desired.values))
+
 
 if __name__ == "__main__":
     main()
